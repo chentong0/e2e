@@ -70,7 +70,7 @@ from torch.nn.functional import scaled_dot_product_attention
 
 # torch.func provides functional programming utilities for PyTorch
 # Used for differentiable inner loop training
-import torch.func as functorch
+from torch.func import functional_call
 
 
 # =============================================================================
@@ -1316,6 +1316,28 @@ class MetaModel(nn.Module):
             if id(param) in inner_param_set
         }
     
+    def _get_block_inner_params(
+        self,
+        block_idx: int,
+        inner_params: dict[str, Tensor],
+    ) -> dict[str, Tensor]:
+        """
+        Extract inner parameters for a specific suffix block.
+        
+        Args:
+            block_idx: Index of the block in _suffix_blocks
+            inner_params: Full dictionary of inner parameters
+            
+        Returns:
+            Dictionary of parameters for this block's prime FFN
+        """
+        block_prefix = f"_suffix_blocks.{block_idx}.feed_forward_prime."
+        return {
+            k[len(block_prefix):]: v 
+            for k, v in inner_params.items() 
+            if k.startswith(block_prefix)
+        }
+    
     def lm_loss(
         self,
         seq: Batch,
@@ -1371,9 +1393,6 @@ class MetaModel(nn.Module):
         Returns:
             Scalar loss tensor
         """
-        # Use functional_call to forward with custom parameters
-        # We need to replace the inner params in the model temporarily
-        
         # Get the suffix blocks
         suffix_blocks = self._suffix_blocks
         hidden_states = prefix_outputs
@@ -1381,13 +1400,7 @@ class MetaModel(nn.Module):
         # Process through suffix blocks using functional_call for inner params
         for i, block in enumerate(suffix_blocks):
             if block.feed_forward_prime is not None:
-                # Create a dict of params for this block's prime FFN
-                block_prefix = f"_suffix_blocks.{i}.feed_forward_prime."
-                block_params = {
-                    k[len(block_prefix):]: v 
-                    for k, v in inner_params.items() 
-                    if k.startswith(block_prefix)
-                }
+                block_params = self._get_block_inner_params(i, inner_params)
                 
                 if block_params:
                     # Use functional_call for the prime FFN with updated params
@@ -1454,7 +1467,7 @@ class MetaModel(nn.Module):
                 ff_prime_input = hidden_states
             
             # Use functional_call to apply prime FFN with custom parameters
-            ff_prime_output = functorch.functional_call(
+            ff_prime_output = functional_call(
                 block.feed_forward_prime,
                 prime_ffn_params,
                 (ff_prime_input,),
@@ -1513,12 +1526,7 @@ class MetaModel(nn.Module):
         
         for i, block in enumerate(self._suffix_blocks):
             if block.feed_forward_prime is not None:
-                block_prefix = f"_suffix_blocks.{i}.feed_forward_prime."
-                block_params = {
-                    k[len(block_prefix):]: v 
-                    for k, v in inner_params.items() 
-                    if k.startswith(block_prefix)
-                }
+                block_params = self._get_block_inner_params(i, inner_params)
                 
                 if block_params:
                     hidden_states = self._forward_block_with_inner_params(
@@ -1695,18 +1703,18 @@ class MetaModel(nn.Module):
                 )
                 all_losses.append(chunk_loss)
             
-            # 7. Aggregate losses and metrics
-            loss = torch.stack(all_losses).mean()
+            # 7. Aggregate losses and metrics (running sum for memory efficiency)
+            total_loss = sum(all_losses) / len(all_losses)
             metrics = {
-                M.loss: torch.stack(all_metrics[M.loss]).mean(),
-                M.token_nll_loss: torch.stack(all_metrics[M.token_nll_loss]).mean(),
+                M.loss: sum(all_metrics[M.loss]) / len(all_metrics[M.loss]),
+                M.token_nll_loss: sum(all_metrics[M.token_nll_loss]) / len(all_metrics[M.token_nll_loss]),
             }
             
             # Clean up temporary references
             del self._prefix_blocks
             del self._suffix_blocks
             
-            return loss, metrics
+            return total_loss, metrics
         
         else:
             raise NotImplementedError(f"Unknown train_mode: {cfg.training.train_mode}")
