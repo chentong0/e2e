@@ -1,5 +1,6 @@
 # End-to-End Test-Time Training for Long Context
 [**Paper**](https://test-time-training.github.io/e2e.pdf)
+| [**Implementation Guide**](E2E_TTT_IMPLEMENTATION_GUIDE.md)
 | [**Setup**](#setup)
 | [**Replicating Experiments**](#replicating-experiments)
 
@@ -10,6 +11,17 @@ Under this formulation, we only use a standard architecture – a Transformer wi
 However, our model continues learning at test time via next-token prediction on the given context, compressing the context it reads into its weights.
 In addition, we improve the model's initialization for learning at test time via meta-learning at training time.
 Overall, our method, a form of Test-Time Training (TTT), is End-to-End (E2E) both at test time (via next-token prediction) and training time (via meta-learning), in contrast to previous forms.
+
+## Implementation Guide
+
+For a comprehensive guide to understanding how this codebase implements the E2E-TTT algorithm, including:
+- Forward pass implementation details
+- Inner loop backpropagation mechanism (autograd vs. manual)
+- Multinode sharding support
+- Learning rate and scheduler controls
+- Stability improvements during training
+
+See **[E2E_TTT_IMPLEMENTATION_GUIDE.md](E2E_TTT_IMPLEMENTATION_GUIDE.md)**.
 
 
 ## Setup
