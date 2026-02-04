@@ -64,12 +64,9 @@ import torch.nn.functional as F
 from torch import Tensor
 from einops import rearrange
 
-# Try to import FlashAttention for efficiency
-try:
-    from torch.nn.functional import scaled_dot_product_attention
-    HAS_FLASH_ATTN = True
-except ImportError:
-    HAS_FLASH_ATTN = False
+# scaled_dot_product_attention is available in PyTorch 2.0+
+# and automatically uses FlashAttention when available
+from torch.nn.functional import scaled_dot_product_attention
 
 
 # =============================================================================
@@ -233,7 +230,8 @@ def precompute_freqs_cis(
         Complex tensor of shape (end, dim//2) containing cos + i*sin
     """
     # Compute frequency bands: theta^(-2i/dim) for i in [0, dim/2)
-    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=dtype)[:dim // 2] / dim))
+    # torch.arange(0, dim, 2) produces dim//2 elements
+    freqs = 1.0 / (theta ** (torch.arange(0, dim, 2, dtype=dtype) / dim))
     
     # Create position indices
     t = torch.arange(end, dtype=dtype)
@@ -619,19 +617,23 @@ class SWAFull(Attention):
         
         xq, xk, xv = self.get_attention_input(hidden_states, position_ids)
         
-        # Create sliding window causal mask
-        window_size = self.config.sliding_window_size
-        
         # Add batch dimension
         xq = xq.unsqueeze(0).transpose(1, 2)
         xk = xk.unsqueeze(0).transpose(1, 2)
         xv = xv.unsqueeze(0).transpose(1, 2)
         
-        # Note: PyTorch 2.0+ supports sliding window in SDPA
-        # For older versions, we'd need to create explicit mask
+        # Create sliding window causal mask
+        # For each query position i, attend only to keys in range [max(0, i-window+1), i]
+        window_size = self.config.sliding_window_size
+        q_idx = torch.arange(seq_len, device=hidden_states.device).unsqueeze(1)
+        k_idx = torch.arange(seq_len, device=hidden_states.device).unsqueeze(0)
+        # Causal + sliding window: key must be <= query and within window
+        attn_mask = (k_idx <= q_idx) & (k_idx >= q_idx - window_size + 1)
+        attn_mask = attn_mask.unsqueeze(0).unsqueeze(0)  # (1, 1, seq_len, seq_len)
+        
         attn_output = scaled_dot_product_attention(
             xq, xk, xv,
-            is_causal=True,
+            attn_mask=attn_mask,
             dropout_p=self.config.attn_pdrop if self.training else 0.0,
         )
         
@@ -1264,10 +1266,11 @@ class MetaModel(nn.Module):
     
     def clone_inner_params(self) -> dict[str, Tensor]:
         """Create a copy of inner parameters for inner loop training."""
+        inner_param_set = set(id(p) for p in self.get_inner_parameters())
         return {
             name: param.clone()
             for name, param in self.named_parameters()
-            if any(p is param for p in self.get_inner_parameters())
+            if id(param) in inner_param_set
         }
     
     def lm_loss(
@@ -1308,9 +1311,12 @@ class MetaModel(nn.Module):
         inner_lr: float,
     ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
         """
-        Perform a single inner loop gradient step.
+        Perform a single inner loop gradient step (stub).
         
         JAX equivalent: inner_loop_step in transformer.py
+        
+        NOTE: This is a stub implementation. Full implementation requires
+        torch.func.grad and functional parameters for differentiable inner loop.
         
         Args:
             seq: Batch for this chunk
@@ -1320,22 +1326,15 @@ class MetaModel(nn.Module):
             
         Returns:
             Tuple of (updated_params, metrics)
+            
+        Raises:
+            NotImplementedError: This method is not yet fully implemented.
         """
-        # This is a simplified version - full implementation would use
-        # torch.func.grad and functional parameters
-        
-        # For now, compute loss and gradients
-        loss, ce_loss, token_nll = self.lm_loss(seq, prefix_outputs)
-        
-        # In a full implementation, we'd update inner_params here
-        # using functional gradients
-        
-        metrics = {
-            self.MetricType.loss: ce_loss.detach(),
-            self.MetricType.token_nll_loss: token_nll.detach().mean(),
-        }
-        
-        return inner_params, metrics
+        raise NotImplementedError(
+            "inner_loop_step requires torch.func for functional gradients. "
+            "Full implementation would use torch.func.grad to compute gradients "
+            "and update inner_params in a differentiable manner."
+        )
     
     def loss_for_sequence(
         self,
@@ -1374,18 +1373,17 @@ class MetaModel(nn.Module):
         
         elif cfg.training.train_mode == "meta":
             # Meta-learning with inner loop
-            # This is a simplified implementation
             # Full implementation would:
-            # 1. Create BlockCollectionSplit
-            # 2. Process prefix once
-            # 3. Chunk sequence and iterate inner loop
-            
-            loss, ce_loss, token_nll = self.lm_loss(seq)
-            
-            return loss, {
-                self.MetricType.loss: ce_loss.detach(),
-                self.MetricType.token_nll_loss: token_nll.detach().mean(),
-            }
+            # 1. Create BlockCollectionSplit to separate prefix/suffix blocks
+            # 2. Process prefix blocks once (frozen)
+            # 3. Chunk sequence into mini-batches
+            # 4. For each chunk, perform inner loop gradient update on suffix params
+            # 5. Return total loss for outer gradient
+            raise NotImplementedError(
+                "Meta-learning mode requires inner_loop_step implementation with "
+                "torch.func for differentiable inner loop training. "
+                "Use train_mode='pretrain' for standard training."
+            )
         
         else:
             raise NotImplementedError(f"Unknown train_mode: {cfg.training.train_mode}")
