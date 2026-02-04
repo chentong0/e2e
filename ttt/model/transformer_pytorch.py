@@ -68,6 +68,10 @@ from einops import rearrange
 # and automatically uses FlashAttention when available
 from torch.nn.functional import scaled_dot_product_attention
 
+# torch.func provides functional programming utilities for PyTorch
+# Used for differentiable inner loop training
+import torch.func as functorch
+
 
 # =============================================================================
 # Configuration Classes
@@ -1133,6 +1137,45 @@ class CausalLM(nn.Module):
             last_hidden_states=hidden_states,
             logits=logits,
         )
+    
+    def suffix_call(
+        self,
+        prefix_outputs: Tensor,
+        seq: Batch,
+        suffix_blocks: nn.ModuleList,
+        ln_f: nn.Module,
+    ) -> "CausalLM.Output":
+        """
+        Continue forward pass from prefix outputs through suffix blocks.
+        
+        Used in meta-learning where prefix is processed once and cached,
+        then suffix is processed with updated inner parameters.
+        
+        Args:
+            prefix_outputs: Hidden states from prefix blocks (seq_len, hidden_size)
+            seq: Batch data
+            suffix_blocks: List of suffix transformer blocks
+            ln_f: Final layer normalization
+            
+        Returns:
+            Output with logits
+        """
+        hidden_states = prefix_outputs
+        
+        # Process through suffix blocks
+        for block in suffix_blocks:
+            hidden_states = block(hidden_states, seq, is_prefix=False)
+        
+        # Apply final layer norm
+        hidden_states = ln_f(hidden_states)
+        
+        # Get logits
+        logits = self.wte_disembed_call(hidden_states)
+        
+        return CausalLM.Output(
+            last_hidden_states=hidden_states,
+            logits=logits,
+        )
 
 
 # =============================================================================
@@ -1292,8 +1335,13 @@ class MetaModel(nn.Module):
             lm_outputs = self.language_model(seq)
         else:
             # For meta-learning: continue from prefix outputs through suffix blocks
-            # This requires the split architecture which is handled separately
-            lm_outputs = self.language_model(seq)
+            # This requires the suffix blocks and final norm
+            lm_outputs = self.language_model.suffix_call(
+                prefix_outputs=prefix_outputs,
+                seq=seq,
+                suffix_blocks=self._suffix_blocks,
+                ln_f=self.language_model.model.ln_f,
+            )
         
         logits = lm_outputs.logits
         loss, ce_loss = cross_entropy_loss_and_accuracy(
@@ -1303,38 +1351,214 @@ class MetaModel(nn.Module):
         
         return loss, ce_loss, token_nll
     
-    def inner_loop_step(
+    def _compute_suffix_loss(
         self,
+        inner_params: dict[str, Tensor],
         seq: Batch,
         prefix_outputs: Tensor,
+    ) -> Tensor:
+        """
+        Compute loss using suffix blocks with given inner parameters.
+        
+        This function is designed to be used with torch.func.grad for
+        computing gradients with respect to inner_params.
+        
+        Args:
+            inner_params: Dictionary of inner parameter tensors
+            seq: Batch data for this chunk
+            prefix_outputs: Precomputed prefix hidden states
+            
+        Returns:
+            Scalar loss tensor
+        """
+        # Use functional_call to forward with custom parameters
+        # We need to replace the inner params in the model temporarily
+        
+        # Get the suffix blocks
+        suffix_blocks = self._suffix_blocks
+        hidden_states = prefix_outputs
+        
+        # Process through suffix blocks using functional_call for inner params
+        for i, block in enumerate(suffix_blocks):
+            if block.feed_forward_prime is not None:
+                # Create a dict of params for this block's prime FFN
+                block_prefix = f"_suffix_blocks.{i}.feed_forward_prime."
+                block_params = {
+                    k[len(block_prefix):]: v 
+                    for k, v in inner_params.items() 
+                    if k.startswith(block_prefix)
+                }
+                
+                if block_params:
+                    # Use functional_call for the prime FFN with updated params
+                    hidden_states = self._forward_block_with_inner_params(
+                        block, hidden_states, seq, block_params
+                    )
+                else:
+                    hidden_states = block(hidden_states, seq, is_prefix=False)
+            else:
+                hidden_states = block(hidden_states, seq, is_prefix=False)
+        
+        # Apply final layer norm
+        hidden_states = self.language_model.model.ln_f(hidden_states)
+        
+        # Get logits
+        logits = self.language_model.wte_disembed_call(hidden_states)
+        
+        # Compute loss
+        loss, _ = cross_entropy_loss_and_accuracy(
+            logits, seq.target_tokens, seq.loss_masks
+        )
+        
+        return loss
+    
+    def _forward_block_with_inner_params(
+        self,
+        block: nn.Module,
+        hidden_states: Tensor,
+        seq: Batch,
+        prime_ffn_params: dict[str, Tensor],
+    ) -> Tensor:
+        """
+        Forward through a block, using functional_call for the prime FFN.
+        
+        Args:
+            block: Transformer block
+            hidden_states: Input hidden states
+            seq: Batch data
+            prime_ffn_params: Parameters for the prime FFN
+            
+        Returns:
+            Output hidden states
+        """
+        config = block.config
+        
+        # Attention sublayer
+        if config.pre_norm:
+            seq_modeling_input = block.seq_norm(hidden_states)
+        else:
+            seq_modeling_input = hidden_states
+        
+        seq_modeling_output = block.seq_modeling_block(seq_modeling_input, seq, is_prefix=False)
+        
+        if config.post_norm:
+            seq_modeling_output = block.seq_post_norm(seq_modeling_output)
+        
+        hidden_states = hidden_states + seq_modeling_output
+        
+        # Prime FFN sublayer - use functional_call with updated params
+        if block.feed_forward_prime is not None:
+            if config.pre_norm:
+                ff_prime_input = block.ffn_prime_norm(hidden_states)
+            else:
+                ff_prime_input = hidden_states
+            
+            # Use functional_call to apply prime FFN with custom parameters
+            ff_prime_output = functorch.functional_call(
+                block.feed_forward_prime,
+                prime_ffn_params,
+                (ff_prime_input,),
+            )
+            
+            if config.post_norm:
+                ff_prime_output = block.ffn_prime_post_norm(ff_prime_output)
+            
+            hidden_states = hidden_states + ff_prime_output
+        
+        # Main FFN sublayer
+        if config.pre_norm:
+            ff_input = block.ffn_norm(hidden_states)
+        else:
+            ff_input = hidden_states
+        
+        ff_output = block.feed_forward(ff_input)
+        
+        if config.post_norm:
+            ff_output = block.ffn_post_norm(ff_output)
+        
+        hidden_states = hidden_states + ff_output
+        
+        return hidden_states
+    
+    def inner_loop_step(
+        self,
         inner_params: dict[str, Tensor],
+        seq: Batch,
+        prefix_outputs: Tensor,
         inner_lr: float,
     ) -> tuple[dict[str, Tensor], dict[str, Tensor]]:
         """
-        Perform a single inner loop gradient step (stub).
+        Perform a single step of inner loop training.
         
         JAX equivalent: inner_loop_step in transformer.py
         
-        NOTE: This is a stub implementation. Full implementation requires
-        torch.func.grad and functional parameters for differentiable inner loop.
+        This computes gradients of the loss with respect to inner parameters
+        and applies an SGD update. The update is differentiable, allowing
+        gradients to flow back through the inner loop for meta-learning.
         
         Args:
+            inner_params: Current inner parameter tensors (detached dict)
             seq: Batch for this chunk
             prefix_outputs: Precomputed prefix hidden states
-            inner_params: Current inner parameters
             inner_lr: Inner loop learning rate
             
         Returns:
-            Tuple of (updated_params, metrics)
-            
-        Raises:
-            NotImplementedError: This method is not yet fully implemented.
+            Tuple of (updated_params, metrics_dict)
         """
-        raise NotImplementedError(
-            "inner_loop_step requires torch.func for functional gradients. "
-            "Full implementation would use torch.func.grad to compute gradients "
-            "and update inner_params in a differentiable manner."
+        M = MetaModel.MetricType
+        metrics: dict[str, Tensor] = {}
+        
+        # Compute loss and get logits for metrics
+        hidden_states = prefix_outputs
+        
+        for i, block in enumerate(self._suffix_blocks):
+            if block.feed_forward_prime is not None:
+                block_prefix = f"_suffix_blocks.{i}.feed_forward_prime."
+                block_params = {
+                    k[len(block_prefix):]: v 
+                    for k, v in inner_params.items() 
+                    if k.startswith(block_prefix)
+                }
+                
+                if block_params:
+                    hidden_states = self._forward_block_with_inner_params(
+                        block, hidden_states, seq, block_params
+                    )
+                else:
+                    hidden_states = block(hidden_states, seq, is_prefix=False)
+            else:
+                hidden_states = block(hidden_states, seq, is_prefix=False)
+        
+        hidden_states = self.language_model.model.ln_f(hidden_states)
+        logits = self.language_model.wte_disembed_call(hidden_states)
+        
+        # Compute loss
+        loss, ce_loss = cross_entropy_loss_and_accuracy(
+            logits, seq.target_tokens, seq.loss_masks
         )
+        token_nll = -token_log_probs(logits, seq.target_tokens)
+        
+        metrics[M.loss] = ce_loss.detach()
+        metrics[M.token_nll_loss] = token_nll.detach().mean()
+        
+        # Compute gradients with respect to inner params
+        # We need to compute gradients manually since we're using a dict of params
+        grads = torch.autograd.grad(
+            loss,
+            list(inner_params.values()),
+            create_graph=True,  # Allow gradients to flow through for meta-learning
+            allow_unused=True,
+        )
+        
+        # Apply SGD update: param = param - lr * grad
+        updated_params = {}
+        for (name, param), grad in zip(inner_params.items(), grads):
+            if grad is not None:
+                updated_params[name] = param - inner_lr * grad
+            else:
+                updated_params[name] = param
+        
+        return updated_params, metrics
     
     def loss_for_sequence(
         self,
@@ -1361,29 +1585,128 @@ class MetaModel(nn.Module):
             Tuple of (loss, metrics_dict)
         """
         cfg = self.config
+        M = MetaModel.MetricType
         
         if cfg.training.train_mode == "pretrain":
             # Standard pretraining
             loss, ce_loss, token_nll = self.lm_loss(seq)
             
             return loss, {
-                self.MetricType.loss: ce_loss.detach(),
-                self.MetricType.token_nll_loss: token_nll.detach().mean(),
+                M.loss: ce_loss.detach(),
+                M.token_nll_loss: token_nll.detach().mean(),
             }
         
         elif cfg.training.train_mode == "meta":
             # Meta-learning with inner loop
-            # Full implementation would:
-            # 1. Create BlockCollectionSplit to separate prefix/suffix blocks
-            # 2. Process prefix blocks once (frozen)
-            # 3. Chunk sequence into mini-batches
-            # 4. For each chunk, perform inner loop gradient update on suffix params
-            # 5. Return total loss for outer gradient
-            raise NotImplementedError(
-                "Meta-learning mode requires inner_loop_step implementation with "
-                "torch.func for differentiable inner loop training. "
-                "Use train_mode='pretrain' for standard training."
-            )
+            
+            # 1. Split blocks into prefix and suffix
+            blocks = self.language_model.model.h.blocks
+            suffix_len = cfg.model.suffix_len
+            
+            if suffix_len == 0:
+                raise ValueError("Meta-learning requires suffix_len > 0")
+            
+            # Store references for use in inner loop
+            self._prefix_blocks = nn.ModuleList(list(blocks)[:-suffix_len])
+            self._suffix_blocks = nn.ModuleList(list(blocks)[-suffix_len:])
+            
+            # Add prime parameters to suffix blocks if available
+            if self.language_model.model.h.prime_storage is not None:
+                for i, block in enumerate(self._suffix_blocks):
+                    block.feed_forward_prime = self.language_model.model.h.prime_storage.feed_forward_prime[i]
+                    block.ffn_prime_norm = self.language_model.model.h.prime_storage.ffn_prime_norm[i]
+                    block.ffn_prime_post_norm = self.language_model.model.h.prime_storage.ffn_prime_post_norm[i]
+            
+            # 2. Embed tokens and process through prefix blocks once
+            input_embeds = self.language_model.wte_call(seq.input_ids)
+            
+            # Process prefix blocks with gradient checkpointing for memory efficiency
+            # Gradients will flow through for outer parameter updates
+            prefix_output = input_embeds
+            for block in self._prefix_blocks:
+                # Use gradient checkpointing to save memory
+                prefix_output = torch.utils.checkpoint.checkpoint(
+                    block, 
+                    prefix_output, 
+                    seq, 
+                    True,  # is_prefix=True
+                    use_reentrant=False,
+                )
+            
+            # 3. Initialize inner parameters (clone from model)
+            inner_params = {}
+            for i, block in enumerate(self._suffix_blocks):
+                if block.feed_forward_prime is not None:
+                    for name, param in block.feed_forward_prime.named_parameters():
+                        full_name = f"_suffix_blocks.{i}.feed_forward_prime.{name}"
+                        inner_params[full_name] = param.clone().requires_grad_(True)
+            
+            # 4. Get inner learning rate
+            step = self.step_index.item()
+            ilr_multiplier = self.get_ilr_multiplier(step)
+            inner_lr = cfg.training.inner_lr * ilr_multiplier
+            
+            # 5. Chunk sequence into mini-batches
+            seqlen = seq.input_ids.shape[0]
+            tokens_per_chunk = cfg.model.mini_batch_size
+            
+            if seqlen % tokens_per_chunk != 0:
+                raise ValueError(
+                    f"Sequence length {seqlen} must be divisible by "
+                    f"mini_batch_size {tokens_per_chunk}"
+                )
+            
+            num_chunks = seqlen // tokens_per_chunk
+            
+            # 6. Iterate over chunks, doing inner loop training
+            all_losses = []
+            all_metrics = {M.loss: [], M.token_nll_loss: []}
+            
+            for chunk_idx in range(num_chunks):
+                start_idx = chunk_idx * tokens_per_chunk
+                end_idx = start_idx + tokens_per_chunk
+                
+                # Slice the batch for this chunk
+                chunk_seq = Batch(
+                    input_ids=seq.input_ids[start_idx:end_idx],
+                    target_tokens=seq.target_tokens[start_idx:end_idx],
+                    loss_masks=seq.loss_masks[start_idx:end_idx],
+                    attention_mask=seq.attention_mask[start_idx:end_idx] if seq.attention_mask is not None else None,
+                    position_ids=seq.position_ids[start_idx:end_idx] if seq.position_ids is not None else None,
+                )
+                chunk_prefix = prefix_output[start_idx:end_idx]
+                
+                # Perform inner loop step
+                inner_params, chunk_metrics = self.inner_loop_step(
+                    inner_params=inner_params,
+                    seq=chunk_seq,
+                    prefix_outputs=chunk_prefix,
+                    inner_lr=inner_lr,
+                )
+                
+                all_metrics[M.loss].append(chunk_metrics[M.loss])
+                all_metrics[M.token_nll_loss].append(chunk_metrics[M.token_nll_loss])
+                
+                # Compute loss for this chunk with updated params (for outer gradient)
+                chunk_loss = self._compute_suffix_loss(
+                    inner_params=inner_params,
+                    seq=chunk_seq,
+                    prefix_outputs=chunk_prefix,
+                )
+                all_losses.append(chunk_loss)
+            
+            # 7. Aggregate losses and metrics
+            loss = torch.stack(all_losses).mean()
+            metrics = {
+                M.loss: torch.stack(all_metrics[M.loss]).mean(),
+                M.token_nll_loss: torch.stack(all_metrics[M.token_nll_loss]).mean(),
+            }
+            
+            # Clean up temporary references
+            del self._prefix_blocks
+            del self._suffix_blocks
+            
+            return loss, metrics
         
         else:
             raise NotImplementedError(f"Unknown train_mode: {cfg.training.train_mode}")
